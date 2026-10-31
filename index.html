@@ -491,6 +491,84 @@ function plannedVolume(days){
   return v;
 }
 
+// Spoken set reader: turns what was said or dictated into set values. Pure, like the engine above.
+// ctx: {sugW, sugReps, lastW, lastReps, hi (top of the rep range), bw (bodyweight lift)}
+const ONES = ["zero","one","two","three","four","five","six","seven","eight","nine","ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen","nineteen"];
+const TENS = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"];
+const isNumWord = t => t === "oh" || t === "hundred" || ONES.includes(t) || TENS.includes(t) && t !== "";
+function numChunks(toks){
+  const out = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = TENS.indexOf(toks[i]), u = toks[i] === "oh" ? 0 : ONES.indexOf(toks[i]);
+    if (t >= 2) { const n = ONES.indexOf(toks[i+1]); if (n >= 1 && n <= 9) { out.push(t*10 + n); i++; } else out.push(t*10); }
+    else if (u >= 0) out.push(u);
+  }
+  return out;
+}
+// "two twenty five" is 225 and "one oh five" is 105, the way gym weights are said; small loads stay as separate numbers
+function runValues(run, small){
+  const h = run.indexOf("hundred");
+  if (h >= 0) { const parts = numChunks(run.slice(h + 1).filter(t => t !== "and")); const before = numChunks(run.slice(0, h))[0] || 1; return [before*100 + (parts.shift() || 0), ...parts]; }
+  const parts = numChunks(run);
+  if (run.includes("oh") && parts.length >= 3) return [+parts.slice(0, 3).join(""), ...parts.slice(3)];
+  if (!small && parts.length >= 2 && parts[0] >= 1 && parts[0] <= 9 && parts[1] >= 10) return [parts[0]*100 + parts[1], ...parts.slice(2)];
+  return parts;
+}
+function wordsToDigits(s, small){
+  const toks = s.split(" "), out = []; let run = [];
+  const flush = () => { if (run.length) out.push(...runValues(run, small)); run = []; };
+  toks.forEach((t, i) => {
+    if (isNumWord(t) || (t === "a" && toks[i+1] === "hundred") || (t === "and" && run.includes("hundred") && isNumWord(toks[i+1] || ""))) run.push(t);
+    else { flush(); out.push(t); }
+  });
+  flush();
+  return out.join(" ");
+}
+function parseSpoken(text, ctx = {}){
+  const out = {raw:String(text || ""), w:null, reps:null, rir:null, dw:null, dr:null, partials:null, use:null, flags:[]};
+  const N = "(\\d+(?:\\.\\d+)?)";
+  let s = String(text || "").toLowerCase().replace(/(\d),(\d)/g, "$1$2").replace(/[×*]/g, " x ").replace(/\.(?!\d)/g, " ").replace(/[^a-z0-9. ]+/g, " ").replace(/\s+/g, " ").trim();
+  s = ` ${wordsToDigits(s, ctx.sugW > 0 && ctx.sugW < 100)} `.replace(/ (?:pounds?|lbs?|kilos?|kilograms?|kgs?) /g, " ");
+  const take = (re, f) => { const m = s.match(re); if (!m) return false; f(m); s = s.replace(re, " "); return true; };
+  take(/ (?:same as )?(?:as )?(?:the )?suggest(?:ed|ion) /, () => { out.use = "suggested"; });
+  take(/ same weight /, () => { out.w = ctx.lastW ?? null; });
+  take(/ (?:the )?same(?: as (?:last(?: set| time)?|before))?(?: again)? /, () => { out.use = "last"; });
+  take(/ (?:(?:to|at) )?failure | (?:nothing|none|no reps?) left /, () => { out.rir = 0; });
+  take(new RegExp(` ${N} (?:more )?(?:reps? )?(?:left|in reserve|in the tank|in tank) `), m => { out.rir = Math.min(3, +m[1]); });
+  take(new RegExp(` ${N} partials? `), m => { out.partials = +m[1]; });
+  if (!take(new RegExp(` drop(?: set)? ${N} (?:(?:for|x|by|times|to|at) |[24] (?=\\d))?${N} `), m => { out.dw = +m[1]; out.dr = +m[2]; })) take(new RegExp(` drop(?: set)? ${N} `), m => { out.dr = +m[1]; });
+  take(new RegExp(` (?:assist(?:ed|ance)?|minus) ${N} `), m => { out.w = -m[1]; });
+  take(new RegExp(` ${N} reps? `), m => { out.reps = +m[1]; });
+  let nums = [...s.matchAll(/\d+(?:\.\d+)?/g)].map(m => +m[0]);
+  if (nums.length >= 3 && (nums[1] === 2 || nums[1] === 4)) nums.splice(1, 1); // "for" or "to" heard as a digit
+  else if (nums.length >= 3 && nums[0] >= 1 && nums[0] <= 9 && nums[1] >= 10 && nums[1] < 100) nums.splice(0, 2, nums[0]*100 + nums[1]);
+  if (out.use === "suggested") { out.w = ctx.sugW ?? null; out.reps = ctx.sugReps ?? null; }
+  if (out.use === "last") { out.w = ctx.lastW ?? null; out.reps = ctx.lastReps ?? null; }
+  if (nums.length >= 2 && out.w == null && out.reps == null) {
+    const [a, b] = nums; if (a <= 40 && b > 40 && b > a*2) { out.w = b; out.reps = a; } else { out.w = a; out.reps = b; }
+  } else if (nums.length) {
+    const a = nums[0];
+    if (out.use || out.w != null) out.reps = a;
+    else if (out.reps != null) out.w = a;
+    else if (ctx.bw || a <= (ctx.hi || 20) + 5) out.reps = a;
+    else out.w = a;
+  }
+  if (ctx.bw) out.w = null;
+  else if (out.w == null && out.reps != null) out.w = ctx.sugW ?? null;
+  if (out.reps == null && out.w != null) out.flags.push("Reps missing");
+  else if (out.reps == null && out.dr == null && out.partials == null && out.rir == null) out.flags.push("No set heard");
+  if (out.w > 0 && ctx.sugW > 0 && Math.abs(out.w - ctx.sugW) / ctx.sugW > 0.35) out.flags.push("Check the weight");
+  if (out.reps != null && (out.reps < 1 || out.reps > 40)) out.flags.push("Check the reps");
+  return out;
+}
+function spokenSummary(p){
+  const bits = [];
+  if (p.w != null || p.reps != null) bits.push(`${p.w == null ? "BW" : fmtNum(p.w)} x ${p.reps ?? "?"}`);
+  if (p.rir != null) bits.push(`${p.rir} left`);
+  if (p.dr != null) bits.push(`drop ${p.dw == null ? "?" : fmtNum(p.dw)} x ${p.dr}`);
+  if (p.partials != null) bits.push(`${p.partials} partials`);
+  return bits.join(", ");
+}
 
 // Primary / secondary muscle map. Secondary counts as half a set (fractional counting).
 function musclesFor(name){
@@ -554,9 +632,10 @@ const LEGEND = [
   ["K","Working Set","Anything white without a color is a standard working set. Leave about 1 rep in reserve."],
   ["B","Back-off Set","The working set after an endless set. About 10-15% lighter, stay in the rep range."]
 ];
-const APP_VERSION = "1.3";
+const APP_VERSION = "1.3.1";
 const APP_RELEASED = "October 2026";
 const WHATS_NEW = [
+  ["1.3.1: voice test", "Settings has a Voice test that checks how well this phone hears set values at the gym, before voice logging is built. Nothing it hears is logged or saved."],
   ["1.3: web link", "The app has a web address, newcombjohn-max.github.io/workouts, for iPhone and anyone who would rather not keep the file. Added to the Home Screen from there, it opens and logs with no signal and updates itself when it has one. Your sets and workbook never go online. Opening the .html file on a laptop or Android works as before."],
   ["1.2: iPhone", "Works on iPhone as a Home Screen app opened from a web link in Safari; the new iPhone guide walks through setup, connecting your workbook, training and saving. On iPhone, Save opens the share sheet so Save to Files can put the workbook straight into your OneDrive folder, and the rest timer's beep now plays. The Excel reader is built in, so connecting and saving work with no signal on every device."],
   ["1.1: fixes", "Deleted sets no longer come back after a save. Sets logged or edited while a save is running stay marked unsaved instead of being lost on the next connect, and a second Save tap waits for the first. A deload week now covers only its own seven days. Rest-pause sets show a reps-left target of 0, and the Program view names your Excel workbook as its source."],
@@ -1170,11 +1249,58 @@ function viewSettings(){
     <div><b>Forecast.</b> A curve with diminishing returns is fitted to your session bests, weighted toward recent sessions, and projected to the last week of the block with a range that widens with distance.</div>
   </div></section>
   <section class="section"><h3>Sample data</h3><div class="panel"><button class="btn sec" type="button" data-act="${S.demo ? "demo-off" : "demo-on"}">${S.demo ? "Exit sample preview" : "Preview charts with sample data"}</button></div></section>
+  <section class="section"><h3>Voice test</h3><div class="panel stack small" id="vt-body">${voiceTestBody()}</div></section>
   <section class="section"><h3>About</h3><div class="panel stack small">
     <div class="muted">Workout Tracker ${APP_VERSION} · ${APP_RELEASED}</div>
     ${WHATS_NEW.map(([t, d]) => `<div><b>${esc(t)}</b><br>${esc(d)}</div>`).join("")}
   </div></section>`;
 }
+
+// ---------- voice test: tries both ways of hearing a set on this phone; nothing here is logged ----------
+const VT_CTX = {sugW:225, sugReps:11, lastW:220, lastReps:12, hi:15};
+const VT_SAY = [["225 for 10","225 x 10"],["225 for 10, 1 left","225 x 10, 1 left"],["Two twenty five for ten","225 x 10"],["One thirty five for twelve, to failure","135 x 12, 0 left"],["As suggested","225 x 11"],["Twelve","225 x 12"],["225 for 10, drop 150 for 8","225 x 10, drop 150 x 8"],["225 for 10, 4 partials","225 x 10, 4 partials"]];
+const VT = {i:0, log:[], rec:null, local:""};
+const speechApi = () => window.SpeechRecognition || window.webkitSpeechRecognition || null;
+const vtMode = () => (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone ? "Home Screen app" : "browser tab";
+function vtEnv(){ return `${IOS ? "iPhone" : /Android/.test(navigator.userAgent) ? "Android" : "Computer"} · ${vtMode()} · ${navigator.onLine ? "online" : "offline"} · one-tap ${speechApi() ? "offered" : "not offered"}${VT.local ? ` · on-device ${VT.local}` : ""}`; }
+function voiceTestBody(){
+  const say = VT_SAY[VT.i], passed = VT.log.filter(x => x.pass).length;
+  return `<div class="muted">Say each line in your normal gym voice, ideally at the gym. Nothing here is logged or saved. Try it twice: once with signal, once in Airplane mode.</div>
+    <div class="muted">${esc(vtEnv())}</div>
+    ${say ? `<div class="banner info"><b>Say ${VT.i + 1} of ${VT_SAY.length}:</b> "${esc(say[0])}"</div>
+    <button class="btn" type="button" data-act="vt-listen">${VT.rec ? "Listening... tap to stop" : "One-tap: listen now"}</button>
+    <label class="field"><span>Keyboard dictation: tap here, use the keyboard's mic, then Read it</span><input id="vt-text" autocomplete="off" placeholder="225 for 10"></label>
+    <div class="grid2"><button class="btn sec" type="button" data-act="vt-read">Read it</button><button class="btn sec" type="button" data-act="vt-skip">Skip line</button></div>` : `<div class="banner good"><b>Test done:</b> ${passed} of ${VT.log.length} read correctly.</div>`}
+    ${VT.log.length ? `<div class="list">${VT.log.map(x => `<div class="li"><span class="grow"><b>${esc(x.mode)}:</b> ${esc(x.err || `"${x.heard}"`)}${x.err ? "" : `<br><span class="muted">${esc(x.sum || "Not understood")}${x.flags ? " · " + esc(x.flags) : ""}</span>`}</span><span class="badge ${x.pass ? "up" : "down"}">${x.pass ? "Right" : "Miss"}</span></div>`).join("")}</div>
+    <div class="grid2"><button class="btn sec" type="button" data-act="vt-copy">Copy results</button><button class="btn sec" type="button" data-act="vt-reset">Start over</button></div>` : ""}`;
+}
+function vtPaint(){ const b = $("#vt-body"); if (b) b.innerHTML = voiceTestBody(); }
+function vtRecord(mode, heard, err, ms, alts){
+  const say = VT_SAY[VT.i]; if (!say) return;
+  const options = alts && alts.length ? alts : [heard];
+  const reads = options.map(a => parseSpoken(a, VT_CTX));
+  const best = reads.find(p => spokenSummary(p) === say[1]) || reads[0];
+  const sum = spokenSummary(best), pass = !err && sum === say[1];
+  VT.log.push({mode, said:say[0], heard:best.raw, err, ms, sum, flags:best.flags.join(", "), pass});
+  if (pass || err === "") VT.i++;
+  vtPaint();
+}
+function vtListen(){
+  const SR = speechApi();
+  if (!SR) { vtRecord("One-tap", "", "Not offered on this phone"); return; }
+  if (VT.rec) { VT.rec.stop(); return; }
+  const r = new SR(), t0 = Date.now(); let done = false, lim = 0;
+  const finish = (heard, err, alts) => { if (done) return; done = true; clearTimeout(lim); VT.rec = null; vtRecord("One-tap", heard, err, Date.now() - t0, alts); };
+  r.lang = "en-US"; r.interimResults = false; r.maxAlternatives = 3; r.continuous = false;
+  r.onresult = e => { const alts = [...e.results[0]].map(a => a.transcript); finish(alts[0], "", alts); };
+  r.onerror = e => finish("", `Failed: ${e.error || "unknown"}`);
+  r.onend = () => finish("", "Failed: heard nothing");
+  lim = setTimeout(() => { try { r.abort(); } catch(e) {} finish("", "Failed: timed out"); }, 10000);
+  try { VT.rec = r; r.start(); vtPaint(); } catch(e) { finish("", `Failed: ${e.name}`); }
+}
+function vtResults(){ return [`Workout Tracker ${APP_VERSION} voice test`, vtEnv(), ...VT.log.map(x => `${x.pass ? "RIGHT" : "MISS"} | ${x.mode} | said: ${x.said} | heard: ${x.err || x.heard} | read: ${x.sum} | ${x.ms ? Math.round(x.ms/100)/10 + "s" : ""}`)].join("\n"); }
+async function vtCopy(){ try { await navigator.clipboard.writeText(vtResults()); toast("Results copied. Paste them into a message."); } catch(e) { toast("Copy is not available here. Take a screenshot instead."); } }
+if (speechApi() && speechApi().available) speechApi().available({langs:["en-US"], processLocally:true}).then(v => { VT.local = v; }).catch(() => {});
 
 // ---------- Excel workbook backend ----------
 // The workbook is the record. The app keeps a working copy on this device, opens the .xlsx to load
@@ -1403,6 +1529,11 @@ document.addEventListener("click", e => {
   else if (act === "finish") { if (S.demo) return; const s = ensureSession(S.ui.date, day); s.notes = ($("#notes") || {}).value || s.notes; s.finished = new Date().toISOString(); s.readiness = ctxFor(S.ui.date, day).readiness.ratio || s.readiness; enqueue("session", s.sid); save(); TMR = null; tick(); render(); toast(S.queue.length ? "Session finished. Tap Save workbook to update Excel." : "Session finished"); }
   else if (act === "save") saveWorkbook();
   else if (act === "share-ready") shareReady();
+  else if (act === "vt-listen") vtListen();
+  else if (act === "vt-read") { const el = $("#vt-text"), v = el ? el.value.trim() : ""; if (v) vtRecord("Dictation", v, ""); else toast("Dictate the line first."); }
+  else if (act === "vt-skip") { VT.i++; vtPaint(); }
+  else if (act === "vt-copy") vtCopy();
+  else if (act === "vt-reset") { VT.i = 0; VT.log = []; vtPaint(); }
   else if (act === "open") pickWorkbook();
   else if (act === "export") exportCSV();
   else if (act === "savesettings") { const v = id => ($("#" + id) || {}).value; const st = S.settings; st.start = v("s_start") || ""; st.weeks = Math.max(1, parseInt(v("s_weeks")) || 12); st.unit = v("s_unit") || "lb"; st.restScale = +v("s_rest") || 1; Object.keys(st.inc).forEach(k => { const x = parseFloat(v("i_" + k)); if (x > 0) st.inc[k] = x; }); enqueue("settings", "settings"); dataChanged(); save(); render(); toast("Settings saved. Save the workbook to keep them in Excel."); }
